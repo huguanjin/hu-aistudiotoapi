@@ -1,0 +1,87 @@
+# ===================================
+# AIStudioToAPI - Docker Compose 示例配置
+# ===================================
+#
+# 镜像来源：GitHub Actions 自动构建并推送到 GHCR
+#   ghcr.io/<你的GitHub用户名>/<仓库名>:<tag>
+#   本仓库对应：ghcr.io/huguanjin/hu-aistudiotoapi:latest
+#
+# 使用步骤：
+#   1. cp .env.example .env && 编辑 .env        # 必须，否则 env_file 会报错
+#   2. mkdir -p auth data                       # 创建挂载目录（提前建好可避免 owner 变成 root）
+#   3. docker compose up -d
+#   4. 浏览器访问 http://<服务器IP>:7860 ，在控制台登录 Google 账号（VNC 方式）
+#
+# ⚠️ GHCR 首次推送的包默认是私有（private）的，直接 pull 会报 403 / denied。
+#    二选一：
+#      a) 在 GitHub 仓库页 → Packages → 该包 → Package settings 里改为 Public；或
+#      b) 部署机器先登录（PAT 需勾选 read:packages 权限）：
+#         echo <YOUR_PAT> | docker login ghcr.io -u <你的GitHub用户名> --password-stdin
+
+name: aistudio-to-api
+
+services:
+  app:
+    # 生产环境建议固定版本号（如 :1.4.0）而不是 :latest，避免自动升级引入意外变更
+    image: ghcr.io/huguanjin/hu-aistudiotoapi:latest
+    container_name: aistudio-to-api
+
+    # unless-stopped：容器异常退出或宿主机重启后自动拉起，手动 stop 后不自动拉起
+    restart: unless-stopped
+
+    ports:
+      # API 服务器端口。若前置了 Nginx/Caddy 等反向代理，强烈建议改为 "127.0.0.1:7860:7860"，
+      # 避免把控制台和 API 直接暴露到公网。
+      - "7860:7860"
+      # ⚠️ 不要映射 6080 / 5901：这是容器内部的 websockify 与 x11vnc 端口，
+      #    由应用层 /vnc 的 WebSocket 代理转发（见 src/core/ProxyServerSystem.js），
+      #    对外暴露会绕过控制台登录鉴权，直接拿到浏览器画面。
+
+    volumes:
+      # Google 账号认证文件（auth-N.json）持久化目录。
+      # 容器内通过网页控制台登录/VNC 新增的账号会写到这里；
+      # 也可以把本地 npm run setup-auth 生成的文件直接拷进 ./auth。
+      - ./auth:/app/configs/auth
+
+      # 用量统计持久化目录（容器内 /app/data/usage-stats.jsonl）。
+      # 不挂载的话，容器重建后统计数据会丢失。
+      - ./data:/app/data
+
+      # 可选：自定义模型列表。不挂载则使用镜像内置的 configs/models.json
+      # - ./models.json:/app/configs/models.json:ro
+
+    # 从 .env 注入全部配置项（PORT、API_KEYS、SWITCH_ON_USES、代理等，见 .env.example）。
+    # 应用在 NODE_ENV=production 下本身也会读取容器内的 /app/.env，
+    # 这里用 env_file 注入到进程环境变量更直观，两者不冲突。
+    env_file:
+      - .env
+
+    # 以下为覆盖项，优先级高于 env_file。留作显式声明关键参数用，可按需删减。
+    environment:
+      # 服务监听端口与地址，需与上面的 ports 映射保持一致
+      PORT: 7860
+      HOST: 0.0.0.0
+      # 时区，影响日志和统计中的时间显示
+      TZ: Asia/Shanghai
+      # 同时登录的账号数，用于加速切换。调大会显著增加内存占用（约 700MB/账号）
+      MAX_CONTEXTS: 1
+
+    # Firefox/Camoufox 对 /dev/shm 依赖较重，Docker 默认只有 64MB，容易导致浏览器崩溃
+    # （报错常见 "out of shared memory"）。1GB 对单账号足够，多账号可继续调大。
+    shm_size: "1gb"
+
+    # 镜像已内置 HEALTHCHECK（轮询 /health），此处无需重复声明。
+    # 如需被反向代理用 depends_on 等待就绪，可依赖该健康状态：
+    #   depends_on:
+    #     app:
+    #       condition: service_healthy
+
+    logging:
+      driver: json-file
+      options:
+        # 限制日志体积，浏览器自动化日志量较大，避免撑爆磁盘
+        max-size: "10m"
+        max-file: "3"
+
+# 说明：本服务不需要外部数据库，全部状态以文件形式保存在上面的挂载卷中
+# （账号凭证 ./auth、用量统计 ./data），因此没有 db/redis 之类的依赖服务。

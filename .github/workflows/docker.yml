@@ -1,145 +1,88 @@
 name: Publish Docker Image
 
+# 触发方式：推送到 main 分支即自动构建并推送镜像
+# 也可在 Actions 页面手动触发（workflow_dispatch）
 on:
   push:
-    tags: ["v*.*.*"]
+    branches: ["main"]
   workflow_dispatch:
     inputs:
       custom_tag:
-        description: "Custom tag (leave empty for preview-YYYYMMDD-HHMMSS)"
+        description: "自定义 tag（留空则仅推 latest + sha）"
         required: false
         type: string
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME_PRIMARY: ibuhub/aistudio-to-api
-  IMAGE_NAME_LEGACY: ibenzene/aistudio-to-api
-  DOCKERHUB_REPO: ibuhub/aistudio-to-api
-  DOCKERHUB_REPO_LEGACY: ibenzene/aistudio-to-api
-  VERSION: ${{ github.ref_name }}
+
+# 同一分支的新构建会取消上一次仍在进行的构建，避免浪费 Actions 额度
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      id-token: write
+      packages: write # 推送镜像到 GHCR 所需，用内置 GITHUB_TOKEN 即可
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 #v3.5.0
-        with:
-          cosign-release: "v2.2.4"
-
-      - name: Generate tag for manual build
-        if: github.event_name == 'workflow_dispatch'
-        id: generate_tag
+      - name: Compute image name and version
+        id: image
         run: |
-          if [ -n "${{ github.event.inputs.custom_tag }}" ]; then
-              echo "tag=${{ github.event.inputs.custom_tag }}" >> $GITHUB_OUTPUT
-          else
-              TAG="preview-$(date -u +'%Y%m%d-%H%M%S')"
-              echo "tag=$TAG" >> $GITHUB_OUTPUT
-          fi
+          # GHCR 要求仓库路径全小写
+          echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          # 与 metadata-action 的 type=sha,format=short 保持一致（均取 commit 前 7 位）
+          echo "version=${CUSTOM_TAG:-sha-${GITHUB_SHA::7}}" >> "$GITHUB_OUTPUT"
+        env:
+          CUSTOM_TAG: ${{ github.event.inputs.custom_tag }}
         shell: bash
+
+      - name: Set up QEMU
+        # 构建 arm64 镜像时用于跨架构模拟
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
 
-      - name: Log into registry (primary)
-        if: github.event_name != 'pull_request'
+      - name: Log into GHCR
         uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log into registry (legacy - ibenzene)
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ibenzene
-          password: ${{ secrets.LEGACY_REGISTRY_TOKEN }}
-
-      - name: Log into Docker Hub (ibuhub)
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
-        with:
-          username: ibuhub
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
         with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_PRIMARY }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LEGACY }}
-            ${{ env.DOCKERHUB_REPO }}
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
-            type=ref,event=tag
-            type=raw,value=${{ steps.generate_tag.outputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            # main 分支推送 → latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # 每个 commit 额外打一个 sha-<短哈希> 标签，便于回滚到具体提交
+            type=sha,format=short,prefix=sha-
+            # 手动触发时可按需指定自定义 tag
+            type=raw,value=${{ github.event.inputs.custom_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.custom_tag != '' }}
 
-      - name: Build and push Primary (GHCR & ibuhub)
+      - name: Build and push
         id: build-and-push
         uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # 多架构构建。arm64 在 GitHub 上是通过 QEMU 模拟的，耗时明显更长；
+          # 如果只部署 x86_64 服务器，改成 "linux/amd64" 可大幅缩短构建时间。
           platforms: linux/amd64,linux/arm64
-          build-args: VERSION=${{ steps.generate_tag.outputs.tag || env.VERSION }}
+          # 版本号会写入前端界面（vite.config.js 的 __APP_VERSION__）
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
           provenance: false
-
-      - name: Sign Primary Images
-        if: ${{ github.event_name != 'pull_request' }}
-        env:
-          TAGS: ${{ steps.meta.outputs.tags }}
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        run: echo "$TAGS" | xargs -r -n 1 -I {} cosign sign --yes {}@${DIGEST}
-
-      - name: Log into Docker Hub (ibenzene)
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
-        with:
-          username: ibenzene
-          password: ${{ secrets.DOCKERHUB_TOKEN_LEGACY }}
-
-      - name: Extract Docker metadata (Legacy Hub)
-        id: meta-legacy
-        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
-        with:
-          images: |
-            ${{ env.DOCKERHUB_REPO_LEGACY }}
-          tags: |
-            type=ref,event=tag
-            type=raw,value=${{ steps.generate_tag.outputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-
-      - name: Push Legacy to Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta-legacy.outputs.tags }}
-          labels: ${{ steps.meta-legacy.outputs.labels }}
-          cache-from: type=gha
-          platforms: linux/amd64,linux/arm64
-          build-args: VERSION=${{ steps.generate_tag.outputs.tag || env.VERSION }}
-          provenance: false
-
-      - name: Sign Legacy Images
-        if: ${{ github.event_name != 'pull_request' }}
-        env:
-          TAGS: ${{ steps.meta-legacy.outputs.tags }}
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        run: echo "$TAGS" | xargs -r -n 1 -I {} cosign sign --yes {}@${DIGEST}
